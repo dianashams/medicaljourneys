@@ -4,6 +4,10 @@ import numpy as np
 import pandas as pd
 import random
 
+def get_event_from_time(time_event, step_forward):
+    return (time_event < step_forward).astype(int)
+
+# "a" linear times  (diabetes), b => higher prob of a
 def get_time_a(df, rng):
     #2a_ linear times  (diabetes), b => higher prob of a
     eth_beta = np.array([0 if (x==0) else 0.5 if (x==1) else 2 for x in df["eth"]])
@@ -15,9 +19,7 @@ def get_time_a(df, rng):
     time_a = 0.01 + np.round(rng.exponential(1/lp1,len(df)),3)
     return(time_a)
 
-def get_event_from_time(time_event, step_forward):
-    return (time_event < step_forward).astype(int)
-    
+# "b" non-linear effect of bmi
 def get_time_b(df,rng):
     # ~ heart failure,  a => higher prob of b
     #BMI impact is 2 for very low and high levels, 1 for high/ low level, 0 for normal range
@@ -32,13 +34,13 @@ def get_time_b(df,rng):
     time_b = 0.01 + np.round(rng.exponential(1/lp2,len(df)),3)
     return(time_b)
 
+# "c" non-linear effect of bmi plus smoking x age interaction term 
 def get_time_c(df,rng):
     #2c_ x-terms times    (cancer)
     #BMI impact is 2 for very low and high levels, 1 for high/ low level, 0 for normal range
     bmi_beta3 = np.array([2 if (np.abs(x)> 1.5) else 1 if (np.abs(x)>1) else 0 for x in df["bmi"]])  
     # smoking x age interaction, lets assume it affects younger people stronger 
     age_normalised = (df["age"] - 50) / 15
-
     smoke_age_beta = np.select([(df["smoke"] == 1) & (age_normalised <= 0.5),
                                 (df["smoke"] == 1) & (age_normalised < 0.5)],
                                 [2, 1],default=0)
@@ -46,21 +48,20 @@ def get_time_c(df,rng):
     time_c = 0.01 + np.round(rng.exponential(1/lp3,len(df)),3)
     return(time_c)
 
+# "d"  accelerating with age, dependency on ethnicity
 def get_time_d(df,rng):
     #2d_ (dementia)
     age_beta =  (np.maximum(df.age/10 - 45,0)/10*0.1 + np.maximum(df.age/10 - 6,0)**2*0.4)
-
     eth_beta = np.array([0 if (x==0) else 0.2 if (x==1) else 0.5 for x in df["eth"]])
-
     lp4 = 0.01*np.exp(age_beta + eth_beta)
     time_d = 0.01 + np.round(rng.exponential(1/lp4,len(df)),3)
     return(time_d)
 
+# "e"  any comorbidity => higher chances, otherwise weak dependency on eth
 def get_time_e(df,rng):
-    #2d_ (depression,  any comorbidity => higher chances)
+    #2e_ (depression,  any comorbidity => higher chances)
     age_beta =  0
     eth_beta = np.where(df["eth"] == 0, 0.0, 0.5)
-    
     a_beta = (~df["first_a"].isna()).astype(int)
     b_beta = (~df["first_b"].isna()).astype(int)
     c_beta = (~df["first_c"].isna()).astype(int)
@@ -93,6 +94,8 @@ class sim_population:
             "first_c": np.nan, "first_d":np.nan, "first_e":np.nan            
             })
         self.df["age"] = self.df["age_start"]
+        self.df["eth1"] = (self.df["eth"] == 1).astype(int)
+        self.df["eth2"] = (self.df["eth"] == 2).astype(int)
         
         self._generate_times_and_events(rng)
         
