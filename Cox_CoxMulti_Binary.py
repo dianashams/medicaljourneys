@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 ##############################################
-## 1) SIMPLE COX ### 
+## 1) SIMPLE COX ##
 ##############################################
 
 from lifelines import CoxPHFitter
@@ -140,8 +140,8 @@ def train_coxmulti(x2, time2, event2, hidden_dims = (), epochs = 300, K=5):
     return (model)
 
 ##############################################
-# 4) DISCREET TIME BINARY #
-########################################
+## 4) DISCREET TIME BINARY ##
+##############################################
 
 #### Class definition
 def train_coxmulti(x2, time2, event2, hidden_dims = (), epochs = 300, K=5):
@@ -166,49 +166,38 @@ def train_coxmulti(x2, time2, event2, hidden_dims = (), epochs = 300, K=5):
     return (model)
 
 #### Prepare data for BINARY model, for a specific event 
-import numpy as np
 
 def prepare_data_for_event(df, event_type, features, n_intervals=50, even_split=False, event_ratio=0.8):
-
     events = df[f'event_{event_type}'].values
     times = df[f'time_{event_type}'].values
     X = df[features].values
-
     if even_split:
         # equal-width bins
         max_time = times.max()
         interval_width = max_time / n_intervals
         time_intervals = np.floor(times / interval_width).astype(int)
         time_intervals = np.clip(time_intervals, 0, n_intervals - 1)
-
     else:
         # split times
         event_times = np.sort(times[events == 1])
         cens_times  = np.sort(times[events == 0])
-
         # number of cuts
         n_event = int(n_intervals * event_ratio)
         n_cens  = n_intervals - n_event
-
         # quantile-based cuts
         event_cuts = np.quantile(event_times, np.linspace(0, 1, n_event + 2)[1:-1])
         cens_cuts  = np.quantile(cens_times,  np.linspace(0, 1, n_cens + 2)[1:-1])
-
         # combine + clean
         cut_points = np.sort(np.concatenate([event_cuts, cens_cuts]))
         cut_points = np.unique(np.round(cut_points, 6))
-
         # ensure correct number of intervals
         # (digitize creates len(cuts)+1 bins)
         if len(cut_points) > n_intervals - 1:
             cut_points = cut_points[:n_intervals - 1]
-
         # map times → interval indices
         time_intervals = np.digitize(times, bins=cut_points, right=True)
-
         # ensure bounds
         time_intervals = np.clip(time_intervals, 0, n_intervals - 1)
-
     return X, time_intervals, events, n_intervals
 
 #### Training function for BINARY
@@ -239,7 +228,6 @@ def train_event_model(df, event_type, features, lr=0.002, epochs=100, batch_size
             X_batch = X_tensor[batch_indices]
             intervals_batch = intervals_tensor[batch_indices]
             events_batch = events_tensor[batch_indices]
-            
             # Forward pass
             logits = model(X_batch, intervals_batch)
             # Binary cross-entropy loss
@@ -253,3 +241,83 @@ def train_event_model(df, event_type, features, lr=0.002, epochs=100, batch_size
         if ((epoch % 50 == 0) |(epoch +1 == epochs)):
             print(f'Event {event_type} - Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}')
     return model
+
+##############################################
+## 5) DISCREET TIME MULTIBINARY ##
+##############################################
+
+# define multibinary
+class MultiDiscreteTimeNN(nn.Module):
+    def __init__(self, p, n_intervals, K, hidden_dims=()):
+        super().__init__()
+        # -------- feature network (eta) --------
+        layers = []
+        in_dim = p
+        for h in hidden_dims:
+            layers.append(nn.Linear(in_dim, h))
+            layers.append(nn.ReLU())
+            in_dim = h
+        layers.append(nn.Linear(in_dim, K, bias=False))  # (n, K)
+        self.net = nn.Sequential(*layers)
+        # -------- baseline hazards:  
+        # alpha[k, t] = baseline logit for outcome k at interval t
+        self.alpha = nn.Parameter(torch.zeros(K, n_intervals))
+
+    def forward(self, x, interval_idx):
+        """       x:            (n, p)        interval_idx: (n, K)   integers in [0, n_intervals-1]         """
+        eta = self.net(x) # (n, K)
+        n, K = interval_idx.shape
+        # create outcome indices: (n, K)
+        k_idx = torch.arange(K, device=x.device).unsqueeze(0).expand(n, K)
+        # safe lookup: alpha[k, t_ik]
+        alpha_k = self.alpha[k_idx, interval_idx]  # (n, K)
+        logits = eta + alpha_k
+        return logits
+
+    def get_eta(self, x):
+        """Return linear predictors (no baseline)"""
+        return self.net(x)
+
+# prepare the data for multibinary
+def prepare_data_for_multibinary (df, features, event_types = ["a","b","c","d","e"], 
+                                  n_intervals=50, even_split=False, event_ratio=0.8):
+    time_cols  = [f"time_{e}" for e in event_types]
+    event_cols = [f"event_{e}" for e in event_types]
+    times  = df[time_cols].values        # (n, K)
+    events = df[event_cols].values       # (n, K)
+    K = len(event_types)
+    time_intervals = np.zeros_like(times, dtype=int)
+    for kk in range(K):
+        _, ti_k, _, _ = prepare_data_for_event(
+            df, event_type=event_types[kk], features=features, 
+            n_intervals=n_intervals,  even_split=even_split, event_ratio= event_ratio)
+        time_intervals[:, kk] = ti_k
+    return df[features].values, time_intervals, events, n_intervals
+
+# train multibinary
+def prepare_data_for_multibinary (df, features, event_types = ["a","b","c","d","e"], 
+                                  n_intervals=50, even_split=False, event_ratio=0.8):
+    time_cols  = [f"time_{e}" for e in event_types]
+    event_cols = [f"event_{e}" for e in event_types]
+    times  = df[time_cols].values        # (n, K)
+    events = df[event_cols].values       # (n, K)
+    K = len(event_types)
+    time_intervals = np.zeros_like(times, dtype=int)
+    for kk in range(K):
+        _, ti_k, _, _ = prepare_data_for_event(
+            df, event_type=event_types[kk], features=features, 
+            n_intervals=n_intervals,  even_split=even_split, event_ratio= event_ratio)
+        time_intervals[:, kk] = ti_k
+    return df[features].values, time_intervals, events, n_intervals
+
+def get_cindex_multibinary(binmulti, df_test, covariate_cols):
+    with torch.no_grad():
+        eta = binmulti.get_eta(
+            torch.FloatTensor(df_test[covariate_cols].values)
+        ).cpu().numpy()
+    cindex_dict = {}
+    for k, e in enumerate(["a","b","c","d","e"]):
+        risk = eta[:, k]
+        cindex_dict[e] = get_cindex_for_event(-risk, df=df_test,event=e)
+    
+    return cindex_dict
