@@ -127,11 +127,11 @@ def prepare_data_for_multicox(df,
 	return (x2, time2, event2)
 
 #### training function for MultiCox
-def train_coxmulti(x2, time2, event2, hidden_dims = (), epochs = 300, K=5):
+def train_coxmulti(x2, time2, event2, hidden_dims = (), epochs = 300, K=5, lr = 0.01):
     p = len(x2[0])
     # p -number of initial params, len(covariate_cols)
     model = MultiCoxNN(p=p, K=K, hidden_dims = hidden_dims)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)   
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)   
     for epoch in range(epochs):
         optimizer.zero_grad()
         eta2 = model(x2)                     # risk scores
