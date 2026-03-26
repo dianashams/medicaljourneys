@@ -11,10 +11,8 @@ def get_event_from_time(time_event, step_forward):
 def get_time_a(df, rng):
     #2a_ linear times  (diabetes), b => higher prob of a
     eth_beta = np.array([0 if (x==0) else 0.5 if (x==1) else 2 for x in df["eth"]])
-    
     # chances are higher if there was a heart failure before 
     eventb_beta = (~df["first_b"].isna()).astype(int) * 0.3
-
     lp1 = 0.1*np.exp(0.5*df.bmi + 0.7*df.hyp + 0.4*(df.age-50)/15 + eth_beta + eventb_beta)
     time_a = 0.01 + np.round(rng.exponential(1/lp1,len(df)),3)
     return(time_a)
@@ -72,6 +70,9 @@ def get_time_e(df,rng):
     lp5 = 0.01*np.exp(age_beta + eth_beta + comorb_beta)
     time_e = 0.1 + np.round(rng.exponential(1/lp5,len(df)),3)
     return(time_e)
+
+# construct a wide format dataset with baseline covariates and time/event columns for each of the 5 steps
+
 
 class sim_population:
     def __init__(self, N, step_forward, randomseed=None):
@@ -139,3 +140,53 @@ class sim_population:
         
         self._generate_times_and_events(rng_step)
         self._save_state()
+
+    def to_wide_format(self):
+        """  Constructs a wide format dataframe with one row per patient.
+        Returns:- pd.DataFrame: Wide format dataframe containing:
+                - Baseline covariates (from initial state): age_start, age_baseline, bmi, hyp, smoke, sex, eth, eth1, eth2
+                - Step-specific columns for each step in history: time_{event}_step{i}, event_{event}_step{i}
+                  (time values are ABSOLUTE from the beginning of simulation)
+                  (if event == 0, time is set to start + step_forward, indicating no event in this step)
+                - Cumulative first event columns: first_a, first_b, first_c, first_d, first_e
+        """
+        # Get baseline covariates from the initial state (history[0])
+        baseline_df = self.history[0][['id', 'age_start', 'bmi', 'hyp', 'smoke', 'sex', 'eth1', 'eth2']].copy()
+        
+        # Start building the wide format dataframe
+        wide_df = baseline_df.copy()
+
+        event_types = ['a', 'b', 'c', 'd', 'e']
+        # Extract step-specific columns from history
+        for step_idx in range(len(self.history)):  # Changed from range(1, ...) to range(...)
+            step_data = self.history[step_idx]
+            
+            for event_type in event_types:
+                # Add time and event columns for each step
+                time_col_name = f'time_{event_type}_step{step_idx}'
+                event_col_name = f'event_{event_type}_step{step_idx}'
+                wide_df[time_col_name] = step_data[f'time_{event_type}'].values
+                wide_df[event_col_name] = step_data[f'event_{event_type}'].values
+        
+        # Add the "first" event columns (cumulative across all steps)
+        for event_type in event_types: 
+            wide_df[f'first_{event_type}'] = self.df[f'first_{event_type}'].values
+        
+        return wide_df
+        
+    def to_cox_format(self):
+        """  takes baseline covariates + first_ever column to check if event ever happened, 
+        returns baseline + event_{a} + time_{a} columns - ready for Cox-like time-to-event analysis
+        """
+        cox_df = self.history[0][['id', 'age_start', 'bmi', 'hyp', 'smoke', 'sex', 'eth1', 'eth2']].copy()  
+        # Take the last population (use -1 to get the last element)
+        step_data = self.history[-1]
+        for e in ['a', 'b', 'c', 'd', 'e']:
+            # event: 1 if first_{e} is not NaN, 0 otherwise
+            cox_df[f'event_{e}'] = (~step_data[f'first_{e}'].isna()).astype(int)
+            # time: use first_{e} (absolute time from beginning) if event occurred, 
+            # otherwise use the final end time (censored)
+            cox_df[f'time_{e}'] = np.where(cox_df[f'event_{e}'] == 1,
+                                           step_data[f'first_{e}'].values,
+                                           step_data['end'].values)
+        return cox_df
