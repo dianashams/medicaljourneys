@@ -295,21 +295,43 @@ def prepare_data_for_multibinary (df, features, event_types = ["a","b","c","d","
     return df[features].values, time_intervals, events, n_intervals
 
 # train multibinary
-def prepare_data_for_multibinary (df, features, event_types = ["a","b","c","d","e"], 
-                                  n_intervals=50, even_split=False, event_ratio=0.8):
-    time_cols  = [f"time_{e}" for e in event_types]
-    event_cols = [f"event_{e}" for e in event_types]
-    times  = df[time_cols].values        # (n, K)
-    events = df[event_cols].values       # (n, K)
-    K = len(event_types)
-    time_intervals = np.zeros_like(times, dtype=int)
-    for kk in range(K):
-        _, ti_k, _, _ = prepare_data_for_event(
-            df, event_type=event_types[kk], features=features, 
-            n_intervals=n_intervals,  even_split=even_split, event_ratio= event_ratio)
-        time_intervals[:, kk] = ti_k
-    return df[features].values, time_intervals, events, n_intervals
+def train_binmulti(    X,    time_intervals,    events,    n_intervals,
+    hidden_dims=(),    lr=0.01,    epochs=300,    batch_size=1024):
+    """     Train multi-outcome discrete-time binary model    (strict analogue of train_coxmulti)    """
+    n, p = X.shape
+    K = events.shape[1]
+    X_tensor = torch.FloatTensor(X)
+    intervals_tensor = torch.LongTensor(time_intervals)   # (n, K)
+    events_tensor = torch.FloatTensor(events)             # (n, K)
+    model = MultiDiscreteTimeNN(p=p, n_intervals=n_intervals, K=K, hidden_dims=hidden_dims)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    n_batches = (n + batch_size - 1) // batch_size
+    # training loop
+    for epoch in range(epochs):
+        perm = torch.randperm(n)
+        total_loss = 0.0
+        for i in range(n_batches):
+            idx = perm[i * batch_size : (i + 1) * batch_size]
+            X_b = X_tensor[idx]
+            intervals_b = intervals_tensor[idx]   # (b, K)
+            events_b = events_tensor[idx]         # (b, K)
+            # forward
+            logits = model(X_b, intervals_b)      # (b, K)
+            # -------- strict Cox analogy --------
+            loss = 0.0
+            for k in range(K): loss += F.binary_cross_entropy_with_logits(logits[:, k],events_b[:, k])
+            loss = loss / K
+            # backward
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * len(idx)
 
+        avg_loss = total_loss / n
+        if (epoch % 50 == 0) or (epoch + 1 == epochs):
+            print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
+    return model
+    
 def get_cindex_multibinary(binmulti, df_test, covariate_cols):
     with torch.no_grad():
         eta = binmulti.get_eta(
