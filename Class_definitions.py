@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 
 from lifelines.utils import concordance_index
-def get_cindex_for_event(predictions, df = df_short, event = "b"):
+def get_cindex_for_event(predictions, df , event ):
     time_col = f"time_{event}"
     risk_col = f"event_{event}"
     c = concordance_index(df[time_col], predictions, df[risk_col])
@@ -27,7 +27,7 @@ def simplecox(df, covariate_cols = ["age_start", "bmi", "hyp", "smoke", "sex", "
     time_col = f"time_{event_type}"
     event_col = f"event_{event_type}"
     cph = CoxPHFitter()
-    cph.fit(df_short[[time_col, event_col] + covariate_cols], duration_col= time_col, event_col=event_col)
+    cph.fit(df[[time_col, event_col] + covariate_cols], duration_col= time_col, event_col=event_col)
     #s=cph.summary[['coef', 'se(coef)', 'p']]
     #beta_cox = cph.params_.values
     return (cph)
