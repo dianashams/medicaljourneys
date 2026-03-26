@@ -8,6 +8,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+from lifelines.utils import concordance_index
+def get_cindex_for_event(predictions, df = df_short, event = "b"):
+    time_col = f"time_{event}"
+    risk_col = f"event_{event}"
+    c = concordance_index(df[time_col], predictions, df[risk_col])
+    return(c)
+
+
 ##############################################
 ## 1) SIMPLE COX ##
 ##############################################
@@ -112,9 +121,9 @@ def prepare_data_for_multicox(df,
                          covariate_cols = ["age_start", "bmi", "hyp", "smoke", "sex", "eth1", "eth2"], 
 			time_cols = ["time_a", "time_b", "time_c", "time_d","time_e"],
 			event_cols = ["event_a", "event_b", "event_c", "event_d","event_e"]):
-	x2 = torch.tensor( df_short[covariate_cols].values, dtype=torch.float32)
-	time2 = torch.tensor( df_short[time_cols].values, dtype=torch.float32)
-	event2 = torch.tensor(df_short[event_cols].values, dtype=torch.float32)
+	x2 = torch.tensor( df[covariate_cols].values, dtype=torch.float32)
+	time2 = torch.tensor( df[time_cols].values, dtype=torch.float32)
+	event2 = torch.tensor(df[event_cols].values, dtype=torch.float32)
 	return (x2, time2, event2)
 
 #### training function for MultiCox
@@ -144,26 +153,63 @@ def train_coxmulti(x2, time2, event2, hidden_dims = (), epochs = 300, K=5):
 ##############################################
 
 #### Class definition
-def train_coxmulti(x2, time2, event2, hidden_dims = (), epochs = 300, K=5):
-    p = len(x2[0])
-    # p -number of initial params, len(covariate_cols)
-    model = MultiCoxNN(p=p, K=K, hidden_dims = hidden_dims)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)   
-    for epoch in range(epochs):
-        optimizer.zero_grad()
-        eta2 = model(x2)                     # risk scores
-        loss = 0
-        for k in range(K):
-            loss += cox_partial_loglik(
-            eta2[:, k],
-            time2[:, k],
-            event2[:, k])
-        loss = loss / K
-        loss.backward()
-        optimizer.step()
-        if ((epoch % 50 == 0)|(epoch +1 == epochs)):
-            print(f"Epoch {epoch}, loss = {loss.item():.4f}")
-    return (model)
+class DiscreteTimeNN(nn.Module):
+    def __init__(self, p, n_intervals, hidden_dims=(64, 32)):
+        super().__init__()
+        layers = []
+        in_dim = p
+        # hidden layers
+        for h in hidden_dims:
+            layers.append(nn.Linear(in_dim, h))
+            layers.append(nn.ReLU())
+            in_dim = h
+        # output = eta (scalar)
+        layers.append(nn.Linear(in_dim, 1, bias=False))
+        self.net = nn.Sequential(*layers)
+        # baseline hazard
+        self.alpha = nn.Parameter(torch.zeros(n_intervals))
+        
+    def forward(self, x, interval_idx):
+        eta = self.net(x).squeeze()
+        logit = eta + self.alpha[interval_idx]
+        return logit
+        
+    def get_eta(self, x):
+        """Extract f(x)"""
+        return self.net(x).squeeze()
+        
+    def predict_survival(self, x):
+        """Predict survival probabilities for all intervals"""
+        # eta: (n,)
+        eta = self.net(x).squeeze()   # or self.beta(x) if linear
+        # expand to (n, n_intervals)
+        eta = eta.unsqueeze(1)  # (n, 1)
+        alpha = self.alpha.unsqueeze(0)  # (1, n_intervals)
+        logits = eta + alpha  # (n, n_intervals)
+        hazards = torch.sigmoid(logits)  # (n, n_intervals)
+        survival_probs = torch.cumprod(1 - hazards, dim=1)
+        return survival_probs
+        
+    def return_logits(self, x):
+        # eta: (n,)
+        eta = self.net(x).squeeze()   # or self.beta(x) if linear
+        # expand to (n, n_intervals)
+        eta = eta.unsqueeze(1)  # (n, 1)
+        alpha = self.alpha.unsqueeze(0)  # (1, n_intervals)
+        logits = eta + alpha  # (n, n_intervals)
+        return logits
+        
+    def return_hazards(self, x):
+        eta = self.net(x).squeeze()   # or self.beta(x) if linear
+        eta = eta.unsqueeze(1)  # (n, 1)
+        alpha = self.alpha.unsqueeze(0)  # (1, n_intervals)
+        logits = eta + alpha  # (n, n_intervals)
+        hazards = torch.sigmoid(logits)  # (n, n_intervals)
+        return hazards
+
+    def return_etas(self, x):
+        eta = self.net(x).squeeze()   # or self.beta(x) if linear
+        return  eta.unsqueeze(1)
 
 #### Prepare data for BINARY model, for a specific event 
 
