@@ -1,5 +1,3 @@
-
-
 import numpy as np
 import pandas as pd
 import random
@@ -72,8 +70,6 @@ def get_time_e(df,rng):
     return(time_e)
 
 # construct a wide format dataset with baseline covariates and time/event columns for each of the 5 steps
-
-
 class sim_population:
     def __init__(self, N, step_forward, randomseed=None):
         self.N = N
