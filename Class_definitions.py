@@ -392,337 +392,244 @@ def get_cindex_multibinary(binmulti, df_test, covariate_cols):
 
 
 ##############################################
-## 6) DISCRETE TIME MULTIBINARY WITH ATTENTION ##
+## 6) SIMPLE BINARY TIME SERIES FORMAT ##
 ##############################################
-#┌─────────────────────────────────────────────────────────────┐
-#│                                                             │
-#│  BASELINE PATH (existing):                                  │
-#│  Covariates → Dense Layers → η_baseline (K risk scores)     │
-#│                                                             │
-#│  ATTENTION PATH (new):                                      │
-#│  Event History → Transformer → Attention Weights            │
-#│                → Aggregate weighted history                 │
-#│                → Dense Layer → η_attention (K adjustments)  │
-#│                                                             │
-#│  FUSION:                                                    │
-#│  η_final = η_baseline + λ · η_attention                     │
-#│           (or other fusion: concatenate + MLP)              │
-#│ η_final = Dense(32) → ReLU → Dense(32) → ReLU → Dense(5)(η_fused)│
-#│  OUTPUT:                                                    │
-#│  logits = η_final + α[k,t]  (baseline hazards per event)    │
-#│                                                             │
-#└─────────────────────────────────────────────────────────────┘
 
-#### Class definition: MultiDiscreteTimeNN augmented with Attention
-class MultiDiscreteTimeNNWithAttention(nn.Module):
+def prepare_data_simple_timeseries(population, features, event_types=["a","b","c","d","e"]):
     """
-    Multi-outcome discrete-time model with attention enrichment.
+    Create long-format dataframe from population.
+    
+    Each row = (patient, time_period)
+    
+    Returns:
+        df_long: dataframe with columns:
+            - id: patient ID
+            - start_time: start of period
+            - end_time: end of period
+            - event_a, event_b, ...: whether event occurred in this period (0/1)
+            - age_start, bmi, hyp, ...: static covariates
+    """
+    
+    rows = []
+    n_patients = len(population.history[0])
+    n_intervals = len(population.history)
+    
+    # Get baseline covariates
+    df_baseline = population.history[0].copy()
+    
+    # ===== FOR EACH PATIENT AND INTERVAL =====
+    for patient_id in range(n_patients):
+        for interval_idx in range(n_intervals):
+            df_interval = population.history[interval_idx]
+            df_patient_interval = df_interval.iloc[patient_id:patient_id+1]
+            
+            # Get covariates (same for all intervals)
+            covariates = df_baseline.iloc[patient_id][features].to_dict()
+            
+            # Get events for this interval
+            events = {}
+            for e in event_types:
+                col_name = f"event_{e}_step{interval_idx}"
+                if col_name in df_interval.columns:
+                    events[f"event_{e}"] = int(df_patient_interval[col_name].values[0])
+                else:
+                    events[f"event_{e}"] = 0
+            
+            # Build row
+            row = {
+                'id': patient_id,
+                'interval': interval_idx,
+                'start_time': interval_idx,  # Or multiply by step duration
+                'end_time': interval_idx + 1,
+                **covariates,
+                **events
+            }
+            rows.append(row)
+    
+    df_long = pd.DataFrame(rows)
+    return df_long
+
+
+##############################################
+## SIMPLE BINARY MODEL WITH HIDDEN LAYERS ##
+##############################################
+
+class SimpleBinaryTimeSeries(nn.Module):
+    """
+    Simple binary model for time series outcomes.
     
     Architecture:
-    - Baseline path: Covariates → Dense layers → η_baseline (K risk scores)
-    - Attention path: Event history → Transformer → η_attention (K adjustments)
-    - Fusion: η_baseline + λ · η_attention
-    - Refinement: Dense layer(s) to learn better fusion → η_final
-    - Output: logits = η_final + α[k,t]
+    - Input: covariates x (p,)
+    - Hidden layers: optional dense layers
+    - Output: logits for K events
+    
+    logits = MLP(x) + α[interval]
+    
+    where:
+    - MLP learns: covariates → (hidden) → K event logits
+    - α: interval-specific baseline (learned)
     """
     
-    def __init__(self, p, n_intervals, K, hidden_dims=(),
-                 attention_heads=4, attention_dim=32, num_transformer_layers=2,
-                 attention_weight=1.0, fusion_hidden_dims=(32,)):
+    def __init__(self, p, K, n_intervals=5, hidden_dims=()):
         """
         Args:
             p: number of covariates
+            K: number of events
             n_intervals: number of time intervals
-            K: number of outcome events
-            hidden_dims: tuple of hidden layer dimensions for baseline path
-            attention_heads: number of attention heads in transformer
-            attention_dim: dimension of attention embeddings
-            num_transformer_layers: number of transformer encoder layers
-            attention_weight: fixed scaling factor for attention contribution (λ)
-            fusion_hidden_dims: tuple of hidden dims for fusion refinement layer(s)
+            hidden_dims: tuple of hidden layer sizes
+                - hidden_dims=() → linear model (no hidden layers)
+                - hidden_dims=(64, 32) → p → 64 → 32 → K
         """
         super().__init__()
         
-        # ===== BASELINE PATH =====
+        # ===== BUILD MLP NETWORK =====
         layers = []
         in_dim = p
-        for h in hidden_dims:
-            layers.append(nn.Linear(in_dim, h))
+        
+        # Add hidden layers
+        for h_dim in hidden_dims:
+            layers.append(nn.Linear(in_dim, h_dim))
             layers.append(nn.ReLU())
-            in_dim = h
+            in_dim = h_dim
+        
+        # Output layer
         layers.append(nn.Linear(in_dim, K, bias=False))
-        self.baseline_net = nn.Sequential(*layers)
         
-        # ===== ATTENTION PATH =====
-        self.event_embedding = nn.Linear(K, attention_dim)
+        self.mlp = nn.Sequential(*layers)
         
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=attention_dim,
-            nhead=attention_heads,
-            dim_feedforward=attention_dim * 2,
-            batch_first=True,
-            dropout=0.1,
-            activation='relu'
-        )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer, 
-            num_layers=num_transformer_layers
-        )
-        
-        self.attention_pool = nn.Sequential(
-            nn.Linear(attention_dim, attention_dim),
-            nn.ReLU(),
-            nn.Linear(attention_dim, K)
-        )
-        
-        # ===== FUSION REFINEMENT (NEW) =====
-        # Dense layer(s) after fusion to learn better combinations
-        fusion_layers = []
-        fusion_in_dim = K  # Input: fused eta (K scores)
-        
-        for h in fusion_hidden_dims:
-            fusion_layers.append(nn.Linear(fusion_in_dim, h))
-            fusion_layers.append(nn.ReLU())
-            fusion_in_dim = h
-        
-        # Final layer: back to K scores
-        fusion_layers.append(nn.Linear(fusion_in_dim, K, bias=False))
-        self.fusion_refinement = nn.Sequential(*fusion_layers)
-        
-        # ===== ATTENTION WEIGHT =====
-        self.attention_weight = attention_weight
-        
-        # ===== BASELINE HAZARDS =====
+        # ===== INTERVAL BASELINES =====
         self.alpha = nn.Parameter(torch.zeros(K, n_intervals))
         
         self.K = K
         self.n_intervals = n_intervals
     
-    def forward(self, x, interval_idx, event_history=None):
+    def forward(self, x, interval_idx):
         """
-        Forward pass with attention enrichment and fusion refinement.
-        
         Args:
-            x: (batch, p) static covariates
-            interval_idx: (batch, K) current time interval per event
-            event_history: (batch, history_length, K) past events or None
+            x: (batch, p) covariates
+            interval_idx: (batch, K) interval index per event
             
         Returns:
-            logits: (batch, K) hazard logits
+            logits: (batch, K)
         """
-        batch_size = x.shape[0]
+        # MLP: covariates → event logits
+        eta = self.mlp(x)  # (batch, K)
         
-        # ===== BASELINE PATH =====
-        eta_baseline = self.baseline_net(x)  # (batch, K)
-        
-        # ===== ATTENTION PATH + FUSION =====
-        if event_history is not None:
-            event_embedded = self.event_embedding(event_history)
-            attention_output = self.transformer_encoder(event_embedded)
-            attention_pooled = attention_output.mean(dim=1)
-            eta_attention = self.attention_pool(attention_pooled)  # (batch, K)
-            
-            # Fuse baseline + attention
-            eta_fused = eta_baseline + self.attention_weight * eta_attention  # (batch, K)
-        else:
-            eta_fused = eta_baseline
-        
-        # ===== FUSION REFINEMENT (NEW) =====
-        # Pass through dense layer(s) to learn better combinations
-        eta = self.fusion_refinement(eta_fused)  # (batch, K)
-        
-        # ===== BASELINE HAZARDS =====
+        # Add interval baseline
         n, K = interval_idx.shape
         k_idx = torch.arange(K, device=x.device).unsqueeze(0).expand(n, K)
-        alpha_k = self.alpha[k_idx, interval_idx]
+        alpha_k = self.alpha[k_idx, interval_idx]  # (batch, K)
         
         logits = eta + alpha_k
         return logits
     
-    def get_eta(self, x, event_history=None):
-        """Extract linear predictors (for C-index calculation)."""
-        eta_baseline = self.baseline_net(x)
-        
-        if event_history is not None:
-            event_embedded = self.event_embedding(event_history)
-            attention_output = self.transformer_encoder(event_embedded)
-            attention_pooled = attention_output.mean(dim=1)
-            eta_attention = self.attention_pool(attention_pooled)
-            eta_fused = eta_baseline + self.attention_weight * eta_attention
-        else:
-            eta_fused = eta_baseline
-        
-        # Apply fusion refinement
-        eta = self.fusion_refinement(eta_fused)
-        return eta
+    def get_eta(self, x):
+        """Extract linear predictors (without interval baseline)."""
+        return self.mlp(x)
 
 
-#### Prepare data for MultiDiscreteTimeNN with Attention
-def prepare_data_for_multibinary_with_attention(df, features, event_types=["a","b","c","d","e"],
-                                               n_intervals=50, lookback_window=3,
-                                               even_split=True, event_ratio=0.8):
+##############################################
+## TRAINING ##
+##############################################
+
+def train_simple_timeseries(df_long, features, event_types=["a","b","c","d","e"],
+                           hidden_dims=(), lr=0.01, epochs=300, batch_size=512):
     """
-    Prepare data with event history for attention-enriched model.
+    Train simple binary model on long-format data.
     
     Args:
-        df: input dataframe with time_* and event_* columns
-        features: list of covariate column names
-        event_types: list of event types (e.g., ["a","b","c","d","e"])
-        n_intervals: number of time discretization intervals
-        lookback_window: how many past steps to include in history
-        even_split: if True, use equal-width bins; else quantile-based
-        event_ratio: ratio of event/censoring cuts (when even_split=False)
-        
-    Returns:
-        X: (n, p) static covariates
-        time_intervals: (n, K) discretized time intervals
-        events: (n, K) event indicators
-        n_intervals: number of intervals
-        event_history: (n, lookback_window, K) past event history
-    """
-    time_cols = [f"time_{e}" for e in event_types]
-    event_cols = [f"event_{e}" for e in event_types]
-    
-    times = df[time_cols].values        # (n, K)
-    events = df[event_cols].values      # (n, K)
-    K = len(event_types)
-    
-    # Discretize times
-    time_intervals = np.zeros_like(times, dtype=int)
-    for kk in range(K):
-        _, ti_k, _, _ = prepare_data_for_event(
-            df, event_type=event_types[kk], features=features,
-            n_intervals=n_intervals, even_split=even_split, event_ratio=event_ratio)
-        time_intervals[:, kk] = ti_k
-    
-    # ===== BUILD EVENT HISTORY =====
-    event_history = np.zeros((len(df), lookback_window, K))
-    
-    # Check if we have step-wise data in wide format
-    step_cols_exist = f"event_a_step0" in df.columns
-    
-    if step_cols_exist:
-        # Extract from wide format (e.g., event_a_step0, event_a_step1, ...)
-        n_steps = max([int(col.split('step')[1]) for col in df.columns 
-                      if 'step' in col and 'event_' in col]) + 1
-        
-        for step_idx in range(lookback_window):
-            lookback_step = step_idx
-            if lookback_step < n_steps:
-                for e_idx, e in enumerate(event_types):
-                    col_name = f"event_{e}_step{lookback_step}"
-                    if col_name in df.columns:
-                        event_history[:, step_idx, e_idx] = df[col_name].values
-    
-    return (df[features].values,  # X_static: (n, p)
-            time_intervals,        # time_intervals: (n, K)
-            events,               # events: (n, K)
-            n_intervals,
-            event_history)        # event_history: (n, lookback, K)
-
-
-#### Training function for MultiDiscreteTimeNN with Attention
-def train_binmulti_with_attention(X, time_intervals, events, event_history, n_intervals,
-                                 hidden_dims=(), attention_heads=4, attention_dim=32,
-                                 num_transformer_layers=2, attention_weight=1.0,
-                                 fusion_hidden_dims=(32,),
-                                 lr=0.01, epochs=300, batch_size=1024):
-    """
-    Train multi-outcome discrete-time model with attention enrichment and fusion refinement.
-    
-    Args:
-        X: (n, p) static covariates
-        time_intervals: (n, K) time interval indices
-        events: (n, K) event indicators
-        event_history: (n, lookback, K) past event history
-        n_intervals: number of time intervals
-        hidden_dims: tuple of hidden dimensions for baseline path
-        attention_heads: number of attention heads
-        attention_dim: dimension of attention embeddings
-        num_transformer_layers: number of transformer layers
-        attention_weight: scaling factor for attention (λ)
-        fusion_hidden_dims: tuple of hidden dims for fusion refinement MLP
+        df_long: long-format dataframe
+        features: covariate column names
+        event_types: list of events
+        hidden_dims: tuple of hidden dimensions
         lr: learning rate
-        epochs: number of training epochs
+        epochs: number of epochs
         batch_size: batch size
         
     Returns:
-        model: trained MultiDiscreteTimeNNWithAttention
+        model: trained SimpleBinaryTimeSeries
     """
-    n, p = X.shape
-    K = events.shape[1]
     
-    X_tensor = torch.FloatTensor(X)
-    intervals_tensor = torch.LongTensor(time_intervals)
-    events_tensor = torch.FloatTensor(events)
-    history_tensor = torch.FloatTensor(event_history)
+    p = len(features)
+    K = len(event_types)
+    n_intervals = int(df_long['interval'].max()) + 1
     
-    model = MultiDiscreteTimeNNWithAttention(
-        p=p, n_intervals=n_intervals, K=K,
-        hidden_dims=hidden_dims,
-        attention_heads=attention_heads,
-        attention_dim=attention_dim,
-        num_transformer_layers=num_transformer_layers,
-        attention_weight=attention_weight,
-        fusion_hidden_dims=fusion_hidden_dims
-    )
+    # Prepare tensors
+    X = torch.FloatTensor(df_long[features].values)  # (n_rows, p)
+    intervals = torch.LongTensor(df_long['interval'].values.reshape(-1, 1))  # (n_rows, 1)
+    intervals = intervals.expand(-1, K)  # (n_rows, K)
     
+    events_list = []
+    for e in event_types:
+        col_name = f"event_{e}"
+        events_list.append(torch.FloatTensor(df_long[col_name].values))
+    events = torch.stack(events_list, dim=1)  # (n_rows, K)
+    
+    model = SimpleBinaryTimeSeries(p=p, K=K, n_intervals=n_intervals, hidden_dims=hidden_dims)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    n_batches = (n + batch_size - 1) // batch_size
+    
+    n_total = len(df_long)
+    n_batches = (n_total + batch_size - 1) // batch_size
     
     for epoch in range(epochs):
-        perm = torch.randperm(n)
+        perm = torch.randperm(n_total)
         total_loss = 0.0
         
         for i in range(n_batches):
             idx = perm[i * batch_size : (i + 1) * batch_size]
-            X_b = X_tensor[idx]
-            intervals_b = intervals_tensor[idx]
-            events_b = events_tensor[idx]
-            history_b = history_tensor[idx]
             
-            logits = model(X_b, intervals_b, event_history=history_b)
+            X_b = X[idx]
+            intervals_b = intervals[idx]
+            events_b = events[idx]
             
+            # Forward
+            logits = model(X_b, intervals_b)
+            
+            # Loss
             loss = 0.0
             for k in range(K):
                 loss += F.binary_cross_entropy_with_logits(logits[:, k], events_b[:, k])
             loss = loss / K
             
+            # Backward
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            
             total_loss += loss.item() * len(idx)
         
-        avg_loss = total_loss / n
+        avg_loss = total_loss / n_total
         if (epoch % 50 == 0) or (epoch + 1 == epochs):
             print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
     
     return model
 
 
-#### C-index computation for attention model
-def get_cindex_multibinary_with_attention(model, df_test, covariate_cols, event_history_test=None):
-    """     Compute C-index for attention-enriched model.
-    Args:  model: trained MultiDiscreteTimeNNWithAttention
-            df_test: test dataframe
-            covariate_cols: list of covariate column names
-            event_history_test: (n_test, lookback, K) test event history
-    Returns: cindex_dict: dict with C-index for each event
+##############################################
+## EVALUATION ##
+##############################################
+
+def get_cindex_simple_timeseries(model, df_long, features, event_types=["a","b","c","d","e"]):
     """
+    Compute C-index on long-format data.
+    """
+    from lifelines.utils import concordance_index
+    
+    X = torch.FloatTensor(df_long[features].values)
+    intervals = torch.LongTensor(df_long['interval'].values.reshape(-1, 1))
+    K = len(event_types)
+    intervals = intervals.expand(-1, K)
+    
     with torch.no_grad():
-        eta = model.get_eta(
-            torch.FloatTensor(df_test[covariate_cols].values),
-            event_history=torch.FloatTensor(event_history_test) if event_history_test is not None else None
-        ).cpu().numpy()
+        eta = model.get_eta(X).cpu().numpy()
     
     cindex_dict = {}
-    for k, e in enumerate(["a", "b", "c", "d", "e"]):
+    for k, e in enumerate(event_types):
         risk = eta[:, k]
-        cindex_dict[e] = get_cindex_for_event(-risk, df=df_test, event=e)
+        events = df_long[f"event_{e}"].values
+        times = df_long['interval'].values
+        
+        c_index = concordance_index(times, -risk, events)
+        cindex_dict[e] = c_index
     
     return cindex_dict
-
-
-
-###################################################
-
