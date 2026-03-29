@@ -90,7 +90,6 @@ def prepare_data_for_cox(df,
     event = torch.tensor(df[event_col].values, dtype=torch.float32)
     return (x, time, event)
 
-
 ##############################################
 ## 3) Multi Outcome CoxNN (MultiCox) ##
 ##############################################
@@ -574,7 +573,7 @@ def get_cindex_simple_timeseries(model, df_long, features, event_types=["a","b",
     for k, e in enumerate(event_types):
         risk = eta[:, k]
         events = df_long[f"event_{e}"].values
-        times = df_long['end_time'].values  # ← USE END_TIME instead of interval
+        times = df_long['end'].values  # ← USE END_TIME instead of interval
         
         c_index = concordance_index(times, -risk, events)
         cindex_dict[e] = c_index
