@@ -545,20 +545,14 @@ def train_simple_timeseries(df_long, features, event_types=["a","b","c","d","e"]
 
 # data preparation
 def prepare_data_simple_timeseries(population, features, event_types=["a","b","c","d","e"]):
-    """
-    Create long-format dataframe from population.
-    
-    Each row = (patient, time_period)
-    
-    Returns:
-        df_long: dataframe with columns:
+    """    Create long-format dataframe from population.  Each row = (patient, time_period)
+    Returns: df_long: dataframe with columns:
             - id: patient ID
             - start_time: start of period
             - end_time: end of period
             - event_a, event_b, ...: whether event occurred in this period (0/1)
             - age_start, bmi, hyp, ...: static covariates
     """
-    
     rows = []
     n_patients = len(population.history[0])
     n_intervals = len(population.history)
@@ -617,7 +611,7 @@ def get_cindex_simple_timeseries(model, df_long, features, event_types=["a","b",
     for k, e in enumerate(event_types):
         risk = eta[:, k]
         events = df_long[f"event_{e}"].values
-        times = df_long['interval'].values
+        times = df_long['end_time'].values  # ← USE END_TIME instead of interval
         
         c_index = concordance_index(times, -risk, events)
         cindex_dict[e] = c_index
