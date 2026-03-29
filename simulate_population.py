@@ -100,6 +100,10 @@ class sim_population:
         self.history = []
         self._save_state()
     
+    def baseline_df(self):
+        # Get baseline covariates from the initial state (history[0])
+        return (self.history[0][['id', 'age_start', 'bmi', 'hyp', 'smoke', 'sex', 'eth1', 'eth2']])
+        
     def _save_state(self):
         self.history.append(self.df.copy())
 
@@ -146,11 +150,9 @@ class sim_population:
                   (if event == 0, time is set to start + step_forward, indicating no event in this step)
                 - Cumulative first event columns: first_a, first_b, first_c, first_d, first_e
         """
-        # Get baseline covariates from the initial state (history[0])
-        baseline_df = self.history[0][['id', 'age_start', 'bmi', 'hyp', 'smoke', 'sex', 'eth1', 'eth2']].copy()
-        
+       
         # Start building the wide format dataframe
-        wide_df = baseline_df.copy()
+        wide_df = self.baseline_df().copy()
 
         event_types = ['a', 'b', 'c', 'd', 'e']
         # Extract step-specific columns from history
@@ -169,7 +171,22 @@ class sim_population:
             wide_df[f'first_{event_type}'] = self.df[f'first_{event_type}'].values
         
         return wide_df
-        
+    
+    def to_long_format(self):
+        event_types = ['a', 'b', 'c', 'd', 'e']
+        event_cols = [f'event_{e}' for e in event_types]
+        time_cols = [f'time_{e}' for e in event_types]
+        cols_to_add = event_cols + time_cols + ["start", "end"]
+        rows_list = []
+
+        for step_idx, step_data in enumerate(self.history):
+            step_df = self.baseline_df().copy()
+            step_df['interval'] = step_idx
+            step_df[cols_to_add] = step_data[cols_to_add].values
+            rows_list.append(step_df)
+        df_long = pd.concat(rows_list, ignore_index=True)
+        return(df_long)
+
     def to_cox_format(self):
         """  takes baseline covariates + first_ever column to check if event ever happened, 
         returns baseline + event_{a} + time_{a} columns - ready for Cox-like time-to-event analysis
