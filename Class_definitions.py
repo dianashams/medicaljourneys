@@ -543,8 +543,8 @@ def train_simple_timeseries(df_long, features, event_types=["a","b","c","d","e"]
     
     return model
 
-# data preparation
-def prepare_data_simple_timeseries(population, features, event_types=["a","b","c","d","e"]):
+# data preparation : just use population.to_long_format()
+def prepare_data_simple_timeseries(population):
     """    Create long-format dataframe from population.  Each row = (patient, time_period)
     Returns: df_long: dataframe with columns:
             - id: patient ID
@@ -553,44 +553,7 @@ def prepare_data_simple_timeseries(population, features, event_types=["a","b","c
             - event_a, event_b, ...: whether event occurred in this period (0/1)
             - age_start, bmi, hyp, ...: static covariates
     """
-    rows = []
-    n_patients = len(population.history[0])
-    n_intervals = len(population.history)
-    
-    # Get baseline covariates
-    df_baseline = population.history[0].copy()
-    
-    # ===== FOR EACH PATIENT AND INTERVAL =====
-    for patient_id in range(n_patients):
-        for interval_idx in range(n_intervals):
-            df_interval = population.history[interval_idx]
-            df_patient_interval = df_interval.iloc[patient_id:patient_id+1]
-            
-            # Get covariates (same for all intervals)
-            covariates = df_baseline.iloc[patient_id][features].to_dict()
-            
-            # Get events for this interval
-            events = {}
-            for e in event_types:
-                col_name = f"event_{e}_step{interval_idx}"
-                if col_name in df_interval.columns:
-                    events[f"event_{e}"] = int(df_patient_interval[col_name].values[0])
-                else:
-                    events[f"event_{e}"] = 0
-            
-            # Build row
-            row = {
-                'id': patient_id,
-                'interval': interval_idx,
-                'start_time': interval_idx,  # Or multiply by step duration
-                'end_time': interval_idx + 1,
-                **covariates,
-                **events
-            }
-            rows.append(row)
-    
-    df_long = pd.DataFrame(rows)
-    return df_long
+    return population.to_long_format()
 
 ## EVALUATION ##
 def get_cindex_simple_timeseries(model, df_long, features, event_types=["a","b","c","d","e"]):
