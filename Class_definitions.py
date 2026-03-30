@@ -474,7 +474,7 @@ class SimpleBinaryTimeSeries(nn.Module):
         """     Extract interval baselines (α)
                 Returns: alpha: (K, n_intervals) - interval-specific baselines
         """
-        return model.alpha.detach().cpu().numpy()  # (K, n_intervals)
+        return self.alpha.detach().cpu().numpy()  # (K, n_intervals)
     def get_beta (self):
         """     For hidden_dims=() (linear model only) - get beta coefficients.
                 Formula: η_k = β_1*x_1 + β_2*x_2 + ... + β_p*x_p      
@@ -598,6 +598,41 @@ class SimpleBinaryTimeSeries(nn.Module):
         prob_df.index.name = 'Interval'
         
         return prob_df, contrib_dict
+    
+    def get_cumulative_probability(self, x, event_types=None, max_interval=None):
+        """    Compute cumulative probability as complement of survival probability.
+                P(Event by t) = 1 - P(No event by t)       """
+        return 1 - self.get_survival_probability(x, event_types)
+    
+    def get_survival_probability(self, x, event_types=None):
+        """  Compute survival probability (probability of NO event) by each interval.
+                S(interval t) = P(No event by interval t)
+                          = ∏(1 - P(event at τ)) for τ = 0 to t
+        Args:    x: covariate values
+                 event_types: list of event names
+        Returns: surv_prob_df: DataFrame with survival probabilities
+        """
+        import pandas as pd
+        import numpy as np
+        if event_types is None:  event_types = list(range(1, self.K + 1))
+        # Get interval-wise probabilities
+        prob_df = self.get_probability(x, event_types=event_types)
+        # Compute survival probability
+        surv_probs = []
+        for interval in range(self.n_intervals):
+            surv_prob_interval = []
+            for k, event in enumerate(event_types):
+                # Probability of NO event at each timestep
+                no_event_probs = 1.0 - prob_df[event].iloc[:interval+1].values
+                # Cumulative survival probability
+                surv_prob = np.prod(no_event_probs)
+                surv_prob_interval.append(surv_prob)
+            surv_probs.append(surv_prob_interval)
+        
+        # Create DataFrame
+        surv_prob_df = pd.DataFrame(np.stack(surv_probs, axis=0), index=np.arange(self.n_intervals), columns=event_types)
+        surv_prob_df.index.name = 'Interval'
+        return surv_prob_df
 
 ## TRAINING ##
 def train_simple_timeseries(df_long, features, event_types=["a","b","c","d","e"],
