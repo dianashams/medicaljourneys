@@ -444,6 +444,7 @@ class SimpleBinaryTimeSeries(nn.Module):
         
         self.K = K
         self.n_intervals = n_intervals
+        self.hidden_dims = hidden_dims
     
     def forward(self, x, interval_idx):
         """
@@ -486,7 +487,7 @@ class SimpleBinaryTimeSeries(nn.Module):
         betas = self.mlp[0].weight.data.cpu().numpy()  # (K, p)
         return betas
         
-    def get_probability (self, x):
+    def get_probability (self, x, event_types = None):
         """
         Compute P(Event_k | interval) for all intervals given covariate vector.
         Formula:  Logit_k[interval] = η_k + α_k[interval]
