@@ -469,6 +469,135 @@ class SimpleBinaryTimeSeries(nn.Module):
         """Extract linear predictors (without interval baseline)."""
         return self.mlp(x)
 
+    def get_alpha(self):
+        """     Extract interval baselines (α)
+                Returns: alpha: (K, n_intervals) - interval-specific baselines
+        """
+        return model.alpha.detach().cpu().numpy()  # (K, n_intervals)
+    def get_beta (self):
+        """     For hidden_dims=() (linear model only) - get beta coefficients.
+                Formula: η_k = β_1*x_1 + β_2*x_2 + ... + β_p*x_p      
+                Returns:  betas: (K, p) numpy array where betas[k, j] = coefficient for covariate j in event k
+        """
+        if len(self.hidden_dims) > 0:
+            raise ValueError("get_beta() only works for linear models (hidden_dims=()). "
+                           "This model has hidden layers.")
+        # First layer is the only layer: Linear(p, K)
+        betas = self.mlp[0].weight.data.cpu().numpy()  # (K, p)
+        return betas
+        
+    def get_probability (self, x):
+        """
+        Compute P(Event_k | interval) for all intervals given covariate vector.
+        Formula:  Logit_k[interval] = η_k + α_k[interval]
+                    P(Event_k | interval) = sigmoid(Logit_k[interval])
+        Args:
+            x: covariate values (array-like, shape (p,) or pd.Series)
+            event_types: list of event names (uses self.event_types if not provided)
+        Returns:
+            prob_df: DataFrame with shape (n_intervals, K)
+                     rows = intervals, columns = event types
+                     values = P(event | interval)
+        """
+        import pandas as pd
+        if event_types is None:
+            event_types = list(range(1, self.K + 1))  # 1, 2, ..., K instead of Event_0, Event_1, etc.
+        # Convert X to tensor
+        if isinstance(x, pd.Series):
+            X_tensor = torch.FloatTensor(x.values).unsqueeze(0)  # (1, p)
+        else:
+            X_tensor = torch.FloatTensor(x).unsqueeze(0)  # (1, p)
+        with torch.no_grad():
+            eta = self.get_eta(X_tensor).squeeze().cpu().numpy()  # (K,)
+            alpha = self.get_alpha()  # (K, n_intervals)
+            # Compute probabilities for all intervals
+            probs = []
+            for interval in range(self.n_intervals):
+                logits_interval = eta + alpha[:, interval]  # (K,) # Logits for this interval
+                probs_interval = 1.0 / (1.0 + np.exp(-logits_interval))  # (K,)#to probabilities via sigmoid
+                probs.append(probs_interval) 
+            # Stack into (n_intervals, K)
+            probs_array = np.stack(probs, axis=0)
+        # Create DataFrame
+        prob_df = pd.DataFrame(  probs_array,index=np.arange(self.n_intervals), columns=event_types)
+        prob_df.index.name = 'Interval'
+        return prob_df
+    def get_probability_with_contributions(self, x, event_types=None):
+        """
+        For LINEAR models only - compute probabilities and show covariate contributions.
+        
+        Returns:
+            prob_df: DataFrame with probabilities (n_intervals, K)
+            contrib_dict: Dictionary with detailed contributions
+        """
+        import pandas as pd
+        
+        if len(self.hidden_dims) > 0:
+            raise ValueError("get_probability_with_contributions() only works for linear models. "
+                           "This model has hidden layers.")
+        
+        if event_types is None:
+            event_types = self.event_types
+        
+        # Convert X to tensor/array
+        if isinstance(x, pd.Series):
+            x_vals = x.values
+            feature_names = x.index.tolist()
+        else:
+            x_vals = np.array(x)
+            feature_names = [f"Feature_{i}" for i in range(len(x_vals))]
+        
+        # Get coefficients
+        betas = self.get_beta()  # (K, p)
+        alpha = self.get_alpha()  # (K, n_intervals)
+        
+        # Store probabilities and contributions
+        probs = []
+        contrib_dict = {}
+        
+        for interval in range(self.n_intervals):
+            probs_interval = []
+            
+            for k, event in enumerate(event_types):
+                # Linear combination: Σ β_jk * x_j
+                linear_sum = np.dot(betas[k], x_vals)
+                
+                # Add interval baseline
+                logit = linear_sum + alpha[k, interval]
+                
+                # Convert to probability
+                prob = 1.0 / (1.0 + np.exp(-logit))
+                probs_interval.append(prob)
+                
+                # Store contributions
+                if event not in contrib_dict:
+                    contrib_dict[event] = {}
+                
+                contrib_dict[event][interval] = {
+                    'linear_sum': linear_sum,
+                    'alpha': alpha[k, interval],
+                    'logit': logit,
+                    'probability': prob,
+                    'feature_contributions': {}
+                }
+                
+                # Feature-level contributions
+                for j, feat in enumerate(feature_names):
+                    contrib = betas[k, j] * x_vals[j]
+                    contrib_dict[event][interval]['feature_contributions'][feat] = contrib
+            
+            probs.append(probs_interval)
+        
+        # Create probability DataFrame
+        prob_df = pd.DataFrame(
+            np.stack(probs, axis=0),
+            index=np.arange(self.n_intervals),
+            columns=event_types
+        )
+        prob_df.index.name = 'Interval'
+        
+        return prob_df, contrib_dict
+
 ## TRAINING ##
 def train_simple_timeseries(df_long, features, event_types=["a","b","c","d","e"],
                            hidden_dims=(), lr=0.01, epochs=300, batch_size=512):
