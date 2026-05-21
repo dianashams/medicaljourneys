@@ -394,7 +394,10 @@ def get_cindex_multibinary(binmulti, df_test, covariate_cols):
 ## 6) SIMPLE BINARY MODEL WITH HIDDEN LAYERS ##
 ##############################################
 
-#Let's just do a simple binary loss for the data where 1) from the population we create a long-term data frame, with id, start-#end time stamps, and event_a etc 1/0. 2) each patient contributes independently binary loss for each time period. 
+#Let's just do a simple binary loss for the data where 
+# 1) from the population we create a long-term data frame, 
+# with id, start and end time stamps, and event_a etc 1/0. 
+# 2) each patient contributes independently binary loss for each time period. 
 
 class SimpleBinaryTimeSeries(nn.Module):
     """
