@@ -112,7 +112,7 @@ class sim_population:
         self.df["time_b"] = get_time_b(self.df, rng)
         self.df["time_c"] = get_time_c(self.df, rng)
         self.df["time_d"] = get_time_d(self.df,rng)
-        self.df["time_e"] = get_time_d(self.df,rng)
+        self.df["time_e"] = get_time_e(self.df,rng)
         self.df["event_a"] = get_event_from_time(self.df["time_a"], self.step_forward)
         self.df["event_b"] = get_event_from_time(self.df["time_b"],self.step_forward)
         self.df["event_c"] = get_event_from_time(self.df["time_c"],self.step_forward)
