@@ -401,349 +401,180 @@ def get_cindex_multibinary(binmulti, df_test, covariate_cols):
 
 class SimpleBinaryTimeSeries(nn.Module):
     """
-    Simple binary model for time series outcomes.
-    
-    Architecture:
-    - Input: covariates x (p,)
-    - Hidden layers: optional dense layers
-    - Output: logits for K events
-    
-    logits = MLP(x) + α[interval]
-    
-    where:
-    - MLP learns: covariates → (hidden) → K event logits
-    - α: interval-specific baseline (learned)
+    Discrete-time multi-outcome survival model.
+
+    logit P(event k in interval t | x) = MLP(x)[k] + α_k[t]
+
+    MLP(x) is shared across all intervals (proportional hazards assumption).
+    α_k[t] is a learned per-event per-interval baseline hazard.
     """
-    
-    def __init__(self, p, K, n_intervals=5, hidden_dims=()):
-        """
-        Args:
-            p: number of covariates
-            K: number of events
-            n_intervals: number of time intervals
-            hidden_dims: tuple of hidden layer sizes
-                - hidden_dims=() → linear model (no hidden layers)
-                - hidden_dims=(64, 32) → p → 64 → 32 → K
-        """
+    def __init__(self, p, K, n_intervals, hidden_dims=()):
         super().__init__()
-        
-        # ===== BUILD MLP NETWORK =====
-        layers = []
-        in_dim = p
-        
-        # Add hidden layers
-        for h_dim in hidden_dims:
-            layers.append(nn.Linear(in_dim, h_dim))
-            layers.append(nn.ReLU())
-            in_dim = h_dim
-        
-        # Output layer
+
+        layers, in_dim = [], p
+        for h in hidden_dims:
+            layers += [nn.Linear(in_dim, h), nn.ReLU()]
+            in_dim = h
         layers.append(nn.Linear(in_dim, K, bias=False))
-        
         self.mlp = nn.Sequential(*layers)
-        
-        # ===== INTERVAL BASELINES =====
-        self.alpha = nn.Parameter(torch.zeros(K, n_intervals))
-        
-        self.K = K
+
+        self.alpha       = nn.Parameter(torch.zeros(K, n_intervals))
+        self.K           = K
         self.n_intervals = n_intervals
         self.hidden_dims = hidden_dims
-    
+
     def forward(self, x, interval_idx):
         """
-        Args:
-            x: (batch, p) covariates
-            interval_idx: (batch, K) interval index per event
-            
-        Returns:
-            logits: (batch, K)
+        x            : (B, p)
+        interval_idx : (B, K)  — same interval index for all K events per row
+        returns logits (B, K)
         """
-        # MLP: covariates → event logits
-        eta = self.mlp(x)  # (batch, K)
-        
-        # Add interval baseline
-        n, K = interval_idx.shape
-        k_idx = torch.arange(K, device=x.device).unsqueeze(0).expand(n, K)
-        alpha_k = self.alpha[k_idx, interval_idx]  # (batch, K)
-        
-        logits = eta + alpha_k
-        return logits
-    
+        eta   = self.mlp(x)                                          # (B, K)
+        k_idx = torch.arange(self.K, device=x.device).unsqueeze(0).expand_as(interval_idx)
+        alpha = self.alpha[k_idx, interval_idx]                      # (B, K)
+        return eta + alpha
+
     def get_eta(self, x):
-        """Extract linear predictors (without interval baseline)."""
+        """Covariate risk score (no interval baseline). Used for C-index ranking."""
         return self.mlp(x)
 
     def get_alpha(self):
-        """     Extract interval baselines (α)
-                Returns: alpha: (K, n_intervals) - interval-specific baselines
-        """
-        return self.alpha.detach().cpu().numpy()  # (K, n_intervals)
-    def get_beta (self):
-        """     For hidden_dims=() (linear model only) - get beta coefficients.
-                Formula: η_k = β_1*x_1 + β_2*x_2 + ... + β_p*x_p      
-                Returns:  betas: (K, p) numpy array where betas[k, j] = coefficient for covariate j in event k
-        """
-        if len(self.hidden_dims) > 0:
-            raise ValueError("get_beta() only works for linear models (hidden_dims=()). "
-                           "This model has hidden layers.")
-        # First layer is the only layer: Linear(p, K)
-        betas = self.mlp[0].weight.data.cpu().numpy()  # (K, p)
-        return betas
-        
-    def get_probability (self, x, event_types = None):
-        """
-        Compute P(Event_k | interval) for all intervals given covariate vector.
-        Formula:  Logit_k[interval] = η_k + α_k[interval]
-                    P(Event_k | interval) = sigmoid(Logit_k[interval])
-        Args:
-            x: covariate values (array-like, shape (p,) or pd.Series)
-            event_types: list of event names (uses self.event_types if not provided)
-        Returns:
-            prob_df: DataFrame with shape (n_intervals, K)
-                     rows = intervals, columns = event types
-                     values = P(event | interval)
-        """
-        import pandas as pd
-        if event_types is None:
-            event_types = list(range(1, self.K + 1))  # 1, 2, ..., K instead of Event_0, Event_1, etc.
-        # Convert X to tensor
-        if isinstance(x, pd.Series):
-            X_tensor = torch.FloatTensor(x.values).unsqueeze(0)  # (1, p)
-        else:
-            X_tensor = torch.FloatTensor(x).unsqueeze(0)  # (1, p)
-        with torch.no_grad():
-            eta = self.get_eta(X_tensor).squeeze().cpu().numpy()  # (K,)
-            alpha = self.get_alpha()  # (K, n_intervals)
-            # Compute probabilities for all intervals
-            probs = []
-            for interval in range(self.n_intervals):
-                logits_interval = eta + alpha[:, interval]  # (K,) # Logits for this interval
-                probs_interval = 1.0 / (1.0 + np.exp(-logits_interval))  # (K,)#to probabilities via sigmoid
-                probs.append(probs_interval) 
-            # Stack into (n_intervals, K)
-            probs_array = np.stack(probs, axis=0)
-        # Create DataFrame
-        prob_df = pd.DataFrame(  probs_array,index=np.arange(self.n_intervals), columns=event_types)
-        prob_df.index.name = 'Interval'
-        return prob_df
-    def get_probability_with_contributions(self, x, event_types=None):
-        """
-        For LINEAR models only - compute probabilities and show covariate contributions.
-        
-        Returns:
-            prob_df: DataFrame with probabilities (n_intervals, K)
-            contrib_dict: Dictionary with detailed contributions
-        """
-        import pandas as pd
-        
-        if len(self.hidden_dims) > 0:
-            raise ValueError("get_probability_with_contributions() only works for linear models. "
-                           "This model has hidden layers.")
-        
-        if event_types is None:
-            event_types = self.event_types
-        
-        # Convert X to tensor/array
-        if isinstance(x, pd.Series):
-            x_vals = x.values
-            feature_names = x.index.tolist()
-        else:
-            x_vals = np.array(x)
-            feature_names = [f"Feature_{i}" for i in range(len(x_vals))]
-        
-        # Get coefficients
-        betas = self.get_beta()  # (K, p)
-        alpha = self.get_alpha()  # (K, n_intervals)
-        
-        # Store probabilities and contributions
-        probs = []
-        contrib_dict = {}
-        
-        for interval in range(self.n_intervals):
-            probs_interval = []
-            
-            for k, event in enumerate(event_types):
-                # Linear combination: Σ β_jk * x_j
-                linear_sum = np.dot(betas[k], x_vals)
-                
-                # Add interval baseline
-                logit = linear_sum + alpha[k, interval]
-                
-                # Convert to probability
-                prob = 1.0 / (1.0 + np.exp(-logit))
-                probs_interval.append(prob)
-                
-                # Store contributions
-                if event not in contrib_dict:
-                    contrib_dict[event] = {}
-                
-                contrib_dict[event][interval] = {
-                    'linear_sum': linear_sum,
-                    'alpha': alpha[k, interval],
-                    'logit': logit,
-                    'probability': prob,
-                    'feature_contributions': {}
-                }
-                
-                # Feature-level contributions
-                for j, feat in enumerate(feature_names):
-                    contrib = betas[k, j] * x_vals[j]
-                    contrib_dict[event][interval]['feature_contributions'][feat] = contrib
-            
-            probs.append(probs_interval)
-        
-        # Create probability DataFrame
-        prob_df = pd.DataFrame(
-            np.stack(probs, axis=0),
-            index=np.arange(self.n_intervals),
-            columns=event_types
-        )
-        prob_df.index.name = 'Interval'
-        
-        return prob_df, contrib_dict
-    
-    def get_cumulative_probability(self, x, event_types=None, max_interval=None):
-        """    Compute cumulative probability as complement of survival probability.
-                P(Event by t) = 1 - P(No event by t)       """
-        return 1 - self.get_survival_probability(x, event_types)
-    
-    def get_survival_probability(self, x, event_types=None):
-        """  Compute survival probability (probability of NO event) by each interval.
-                S(interval t) = P(No event by interval t)
-                          = ∏(1 - P(event at τ)) for τ = 0 to t
-        Args:    x: covariate values
-                 event_types: list of event names
-        Returns: surv_prob_df: DataFrame with survival probabilities
-        """
-        import pandas as pd
-        import numpy as np
-        if event_types is None:  event_types = list(range(1, self.K + 1))
-        # Get interval-wise probabilities
-        prob_df = self.get_probability(x, event_types=event_types)
-        # Compute survival probability
-        surv_probs = []
-        for interval in range(self.n_intervals):
-            surv_prob_interval = []
-            for k, event in enumerate(event_types):
-                # Probability of NO event at each timestep
-                no_event_probs = 1.0 - prob_df[event].iloc[:interval+1].values
-                # Cumulative survival probability
-                surv_prob = np.prod(no_event_probs)
-                surv_prob_interval.append(surv_prob)
-            surv_probs.append(surv_prob_interval)
-        
-        # Create DataFrame
-        surv_prob_df = pd.DataFrame(np.stack(surv_probs, axis=0), index=np.arange(self.n_intervals), columns=event_types)
-        surv_prob_df.index.name = 'Interval'
-        return surv_prob_df
+        return self.alpha.detach().cpu().numpy()
 
-## TRAINING ##
-def train_simple_timeseries(df_long, features, event_types=["a","b","c","d","e"],
-                           hidden_dims=(), lr=0.01, epochs=300, batch_size=512):
+    def get_beta(self):
+        if self.hidden_dims:
+            raise ValueError("get_beta() is only valid for linear models (hidden_dims=()).")
+        return self.mlp[0].weight.data.cpu().numpy()   # (K, p)
+
+
+def prepare_data_simple_timeseries(population):
     """
-    Train simple binary model on long-format data.
-    
-    Args:
-        df_long: long-format dataframe
-        features: covariate column names
-        event_types: list of events
-        hidden_dims: tuple of hidden dimensions
-        lr: learning rate
-        epochs: number of epochs
-        batch_size: batch size
-        
-    Returns:
-        model: trained SimpleBinaryTimeSeries
+    Build long-format training data from a sim_population object.
+
+    Returns df_long with one row per (patient, interval), plus mask columns
+    mask_{e} = 1 if the patient is still in the risk set for event e at that
+    interval (i.e. event e has NOT occurred in any prior interval).
+
+    The interval in which the event first occurs IS included in the risk set
+    (it contributes the positive loss signal). Only subsequent intervals
+    are masked out.
     """
-    
-    p = len(features)
-    K = len(event_types)
-    n_intervals = int(df_long['interval'].max()) + 1
-    
-    # Prepare tensors
-    X = torch.FloatTensor(df_long[features].values)  # (n_rows, p)
-    intervals = torch.LongTensor(df_long['interval'].values.reshape(-1, 1))  # (n_rows, 1)
-    intervals = intervals.expand(-1, K)  # (n_rows, K)
-    
-    events_list = []
+    df_long = population.to_long_format()
+    event_types = ['a', 'b', 'c', 'd', 'e']
+
     for e in event_types:
-        col_name = f"event_{e}"
-        events_list.append(torch.FloatTensor(df_long[col_name].values))
-    events = torch.stack(events_list, dim=1)  # (n_rows, K)
-    
-    model = SimpleBinaryTimeSeries(p=p, K=K, n_intervals=n_intervals, hidden_dims=hidden_dims)
+        # cummax gives 1 from the first-occurrence interval onwards
+        # shift(1) asks: "had it happened BEFORE this interval?"
+        prior = (
+            df_long.groupby('id')[f'event_{e}']
+            .transform(lambda s: s.cummax().shift(1).fillna(0))
+        )
+        df_long[f'mask_{e}'] = (1 - prior).astype(np.float32)
+        df_long[f'prev_{e}'] = (prior).astype(np.float32)
+
+    return df_long
+
+
+def train_simple_timeseries(
+    df_long,
+    features,
+    event_types=["a", "b", "c", "d", "e"],
+    hidden_dims=(),
+    lr=0.01,
+    epochs=50,
+    batch_size=512,
+):
+    """
+    Train SimpleBinaryTimeSeries with a masked BCE loss.
+
+    Post-event rows are excluded from the loss via mask_{e} columns that must
+    be present in df_long (produced by prepare_data_simple_timeseries).
+    """
+    p           = len(features)
+    K           = len(event_types)
+    n_intervals = int(df_long['interval'].max()) + 1
+
+    X         = torch.FloatTensor(df_long[features].values)
+    intervals = torch.LongTensor(
+        df_long['interval'].values.reshape(-1, 1)
+    ).expand(-1, K).contiguous()
+
+    events = torch.stack(
+        [torch.FloatTensor(df_long[f'event_{e}'].values) for e in event_types],
+        dim=1
+    )  # (N, K)
+
+    masks = torch.stack(
+        [torch.FloatTensor(df_long[f'mask_{e}'].values) for e in event_types],
+        dim=1
+    )  # (N, K)  — 1 = in risk set, 0 = already had event
+
+    model     = SimpleBinaryTimeSeries(p=p, K=K, n_intervals=n_intervals, hidden_dims=hidden_dims)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    
-    n_total = len(df_long)
-    n_batches = (n_total + batch_size - 1) // batch_size
-    
+
+    N        = len(df_long)
+    n_batches = (N + batch_size - 1) // batch_size
+    total_at_risk = masks.sum().item()
+
     for epoch in range(epochs):
-        perm = torch.randperm(n_total)
-        total_loss = 0.0
-        
+        perm       = torch.randperm(N)
+        epoch_loss = 0.0
+
         for i in range(n_batches):
             idx = perm[i * batch_size : (i + 1) * batch_size]
-            
-            X_b = X[idx]
-            intervals_b = intervals[idx]
-            events_b = events[idx]
-            
-            # Forward
-            logits = model(X_b, intervals_b)
-            
-            # Loss
-            loss = 0.0
-            for k in range(K):
-                loss += F.binary_cross_entropy_with_logits(logits[:, k], events_b[:, k])
-            loss = loss / K
-            
-            # Backward
+
+            logits = model(X[idx], intervals[idx])                # (B, K)
+
+            # Raw BCE per element — then zero out post-event rows
+            loss_raw = F.binary_cross_entropy_with_logits(
+                logits, events[idx], reduction='none'
+            )                                                     # (B, K)
+            loss = (loss_raw * masks[idx]).sum() / masks[idx].sum()
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
-            total_loss += loss.item() * len(idx)
-        
-        avg_loss = total_loss / n_total
+
+            epoch_loss += loss.item() * masks[idx].sum().item()
+
         if (epoch % 50 == 0) or (epoch + 1 == epochs):
-            print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
-    
+            print(f"Epoch {epoch+1}/{epochs}  loss = {epoch_loss / total_at_risk:.4f}")
+
     return model
 
-# data preparation : just use population.to_long_format()
-def prepare_data_simple_timeseries(population):
-    """    Create long-format dataframe from population.  Each row = (patient, time_period)
-    Returns: df_long: dataframe with columns:
-            - id: patient ID
-            - start_time: start of period
-            - end_time: end of period
-            - event_a, event_b, ...: whether event occurred in this period (0/1)
-            - age_start, bmi, hyp, ...: static covariates
-    """
-    return population.to_long_format()
 
-## EVALUATION ##
-def get_cindex_simple_timeseries(model, df_long, features, event_types=["a","b","c","d","e"]):
+def get_cindex_simple_timeseries(
+    model,
+    df_test,
+    features,
+    event_types=["a", "b", "c", "d", "e"],
+):
     """
-    Compute C-index on long-format data.
+    Compute C-index for each event on a wide-format test set.
+
+    Uses get_eta (covariate risk score, no interval baseline) as the ranking
+    score — consistent with how MultiCoxNN and MultiDiscreteTimeNN are evaluated,
+    and correct because covariates are static so eta is identical across all
+    intervals for the same patient.
+
+    Parameters
+    ----------
+    df_test : wide-format dataframe with columns time_{e} and event_{e}
+              (e.g. from population.to_cox_format() test split)
     """
-    from lifelines.utils import concordance_index
-    
-    X = torch.FloatTensor(df_long[features].values)
-    intervals = torch.LongTensor(df_long['interval'].values.reshape(-1, 1))
-    K = len(event_types)
-    intervals = intervals.expand(-1, K)
-    
+    X = torch.FloatTensor(df_test[features].values)
+
     with torch.no_grad():
-        eta = model.get_eta(X).cpu().numpy()
-    
+        eta = model.get_eta(X).numpy()   # (n_test, K)
+
     cindex_dict = {}
     for k, e in enumerate(event_types):
-        risk = eta[:, k]
-        events = df_long[f"event_{e}"].values
-        times = df_long['end'].values  # ← USE END_TIME instead of interval
-        
-        c_index = concordance_index(times, -risk, events)
+        c_index = concordance_index(
+            df_test[f'time_{e}'].values,
+            -eta[:, k],
+            df_test[f'event_{e}'].values,
+        )
         cindex_dict[e] = c_index
-    
+        print(f"  Event {e}: C-index = {c_index:.4f}")
+
     return cindex_dict
