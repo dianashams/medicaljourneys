@@ -82,7 +82,7 @@ class sim_population:
             "start": np.zeros(N),
             "end": np.full(N, step_forward),
             "age_start": np.round(rng.uniform(18, 75, N), 1),
-            "bmi": np.round(rng.normal(0, 1, N), 1),
+            "bmi_start": np.round(rng.normal(0, 1, N), 1),
             "hyp": rng.binomial(1, 0.20, N),
             "smoke": rng.binomial(1, 0.15, N),
             "sex": rng.binomial(1, 0.5, N),
@@ -91,6 +91,7 @@ class sim_population:
             "first_c": np.nan, "first_d":np.nan, "first_e":np.nan            
             })
         self.df["age"] = self.df["age_start"]
+        self.df["bmi"] = self.df["bmi_start"]
         self.df["eth1"] = (self.df["eth"] == 1).astype(int)
         self.df["eth2"] = (self.df["eth"] == 2).astype(int)
         
@@ -102,7 +103,7 @@ class sim_population:
     
     def baseline_df(self):
         # Get baseline covariates from the initial state (history[0])
-        return (self.history[0][['id', 'age_start', 'bmi', 'hyp', 'smoke', 'sex', 'eth1', 'eth2']])
+        return (self.history[0][['id', 'age_start', 'bmi_start', 'hyp', 'smoke', 'sex', 'eth1', 'eth2']])
         
     def _save_state(self):
         self.history.append(self.df.copy())
@@ -137,7 +138,11 @@ class sim_population:
         if self.randomseed is not None: step_seed = self.randomseed + len(self.history)
         # create a temporary generator for this step
         rng_step = np.random.default_rng(step_seed)
-        
+        #update bmi
+        e_before = 1- self.df["first_e"].isna().astype(int)   # 1 if event e happened before
+        self.df["bmi"] = np.round(self.df["bmi"] + 0.2 * e_before - 0.1 * self.df["smoke"]
+            + rng_step.normal(0, 0.2, len(self.df)), 2)
+        # update all events
         self._generate_times_and_events(rng_step)
         self._save_state()
 
@@ -176,7 +181,7 @@ class sim_population:
         event_types = ['a', 'b', 'c', 'd', 'e']
         event_cols = [f'event_{e}' for e in event_types]
         time_cols = [f'time_{e}' for e in event_types]
-        cols_to_add = event_cols + time_cols + ["start", "end"]
+        cols_to_add = event_cols + time_cols + ["start", "end", "age", "bmi"]
         rows_list = []
 
         for step_idx, step_data in enumerate(self.history):
@@ -191,7 +196,7 @@ class sim_population:
         """  takes baseline covariates + first_ever column to check if event ever happened, 
         returns baseline + event_{a} + time_{a} columns - ready for Cox-like time-to-event analysis
         """
-        cox_df = self.history[0][['id', 'age_start', 'bmi', 'hyp', 'smoke', 'sex', 'eth1', 'eth2']].copy()  
+        cox_df = self.history[0][['id', 'age', 'bmi', 'hyp', 'smoke', 'sex', 'eth1', 'eth2']].copy()  
         # Take the last population (use -1 to get the last element)
         step_data = self.history[-1]
         for e in ['a', 'b', 'c', 'd', 'e']:
